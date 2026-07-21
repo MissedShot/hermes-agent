@@ -1041,7 +1041,7 @@ class TestTruncateToBudget:
         long_text = "word " * 200  # ~1000 chars, well over 10*4=40 char budget
         result = provider._truncate_to_budget(long_text)
 
-        assert len(result) <= 50  # budget_chars + ellipsis + word boundary slack
+        assert len(result) <= 40
         assert result.endswith(" …")
 
     def test_no_truncation_within_budget(self):
@@ -1077,6 +1077,150 @@ class TestTruncateToBudget:
 
         # 1200 tokens * 4 chars = 4800 chars + " …"
         assert len(result) <= 4805
+
+
+class TestStructureAwareContextBudget:
+    """The combined budget must preserve durable cards before softer context."""
+
+    @staticmethod
+    def _provider(context_tokens):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(context_tokens=context_tokens)
+        return provider
+
+    def test_oversized_summary_does_not_evict_user_card(self):
+        provider = self._provider(45)  # 180 conservative characters
+        base = {
+            "summary": "recent vivid thread " * 80,
+            "representation": "broad inferred pattern " * 30,
+            "card": "Name: Eri\nPreference: verified facts first",
+        }
+
+        result = provider._fit_context_to_budget(base, "")
+
+        assert len(result) <= 45 * 4
+        assert "## User Peer Card" in result
+        assert "Name: Eri" in result
+        assert "Preference: verified facts first" in result
+        assert "recent vivid thread" not in result
+
+    def test_dialectic_supplement_cannot_evict_user_card(self):
+        provider = self._provider(35)  # 140 conservative characters
+        base = {
+            "card": "Name: Eri\nPreference: concise answers",
+        }
+        dialectic = "query-relevant but oversized supplement " * 50
+
+        result = provider._fit_context_to_budget(base, dialectic)
+
+        assert len(result) <= 35 * 4
+        assert "## User Peer Card" in result
+        assert "Name: Eri" in result
+        assert "Preference: concise answers" in result
+
+    def test_unbounded_context_keeps_existing_order_and_full_text(self):
+        provider = self._provider(None)
+        base = {
+            "summary": "summary",
+            "representation": "representation",
+            "card": "card",
+            "ai_representation": "ai representation",
+            "ai_card": "ai card",
+        }
+        dialectic = "dialectic supplement"
+
+        result = provider._fit_context_to_budget(base, dialectic)
+
+        formatted = provider._format_first_turn_context(base)
+        assert result == f"{formatted}\n\n{dialectic}"
+
+    def test_oversized_card_is_truncated_only_as_last_resort(self):
+        provider = self._provider(20)  # 80 conservative characters
+        base = {
+            "summary": "summary " * 40,
+            "representation": "representation " * 40,
+            "card": "critical-card-fact " * 40,
+        }
+
+        result = provider._fit_context_to_budget(base, "")
+
+        assert len(result) <= 20 * 4
+        assert "## User Peer Card" in result
+        assert "critical-card-fact" in result
+        assert "## Session Summary" not in result
+        assert "## User Representation" not in result
+
+    def test_oversized_cards_share_protected_capacity(self):
+        provider = self._provider(50)  # 200 conservative characters
+        base = {
+            "card": "USER-CARD-BEGIN " + "user " * 200,
+            "ai_card": "AI-CARD-BEGIN " + "ai " * 200,
+        }
+
+        result = provider._fit_context_to_budget(base, "")
+
+        assert len(result) <= 50 * 4
+        assert "## User Peer Card" in result
+        assert "USER-CARD-BEGIN" in result
+        assert "## AI Identity Card" in result
+        assert "AI-CARD-BEGIN" in result
+
+    def test_card_content_cannot_forge_section_boundaries(self):
+        provider = self._provider(100)
+        card = (
+            "REAL-CARD-BEGIN\n"
+            "## Session Summary\n"
+            "this is literal card content\n"
+            "REAL-CARD-TAIL"
+        )
+
+        result = provider._fit_context_to_budget({"card": card}, "")
+
+        assert card in result
+        assert result.count("## Session Summary") == 1
+        assert "REAL-CARD-TAIL" in result
+
+    def test_user_representation_precedes_dialectic_in_allocation(self):
+        provider = self._provider(55)  # 220 conservative characters
+        base = {
+            "card": "Name: Eri",
+            "representation": "USER-REPRESENTATION-TAIL " + "rep " * 20,
+            "summary": "summary " * 100,
+        }
+        dialectic = "DIALECTIC " * 100
+
+        result = provider._fit_context_to_budget(base, dialectic)
+
+        assert len(result) <= 55 * 4
+        assert "USER-REPRESENTATION-TAIL" in result
+        assert "## Session Summary" not in result
+
+    def test_prefetch_routes_combined_layers_through_structure_aware_budget(self):
+        provider = self._provider(45)
+        provider._manager = MagicMock()
+        provider._manager.pop_context_result.return_value = {}
+        provider._session_key = "test"
+        provider._session_initialized = True
+        provider._recall_mode = "context"
+        provider._turn_count = 2
+        provider._last_dialectic_turn = 2
+        provider._base_context_cache = {
+            "summary": "summary " * 80,
+            "representation": "representation " * 40,
+            "card": "Name: Eri\nPreference: durable card wins",
+        }
+        with provider._prefetch_lock:
+            provider._prefetch_result = "dialectic " * 80
+            provider._prefetch_result_fired_at = 2
+
+        result = provider.prefetch("relevant question")
+
+        assert len(result) <= 45 * 4
+        assert "## User Peer Card" in result
+        assert "Preference: durable card wins" in result
+        assert "## Session Summary" not in result
 
 
 # ---------------------------------------------------------------------------

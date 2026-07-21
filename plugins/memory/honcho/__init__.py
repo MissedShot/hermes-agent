@@ -263,7 +263,10 @@ class HonchoMemoryProvider(MemoryProvider):
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
 
         # Base context cache — refreshed on context_cadence, not frozen
-        self._base_context_cache: Optional[str] = None
+        # Production fetches retain the structured Honcho payload so budgeting
+        # never has to parse user-controlled markdown. String values remain
+        # accepted for legacy/tests and are capped as opaque text.
+        self._base_context_cache: Optional[dict[str, str] | str] = None
         self._base_context_lock = threading.Lock()
 
         # Recall cadence and liveness state.
@@ -713,7 +716,7 @@ class HonchoMemoryProvider(MemoryProvider):
             ready = self._consume_pending_dialectic()
             return self._truncate_to_budget(ready) if ready else ""
 
-        parts = []
+        base_context: dict[str, str] | str = {}
 
         # ----- Layer 1: Base context (representation + card) -----
         if not _skip_base:
@@ -722,9 +725,9 @@ class HonchoMemoryProvider(MemoryProvider):
             with self._base_context_lock:
                 _first_base_fetch = self._base_context_cache is None
                 if _first_base_fetch:
-                    self._base_context_cache = ""
+                    self._base_context_cache = {}
                     self._last_context_turn = self._turn_count
-                base_context = self._base_context_cache
+                base_context = self._base_context_cache or {}
 
             if _first_base_fetch and self._manager:
                 _ctx_holder: dict[str, dict] = {}
@@ -755,9 +758,10 @@ class HonchoMemoryProvider(MemoryProvider):
                     self._manager.pop_context_result(self._session_key)
                     formatted = self._format_first_turn_context(_ctx)
                     if formatted:
+                        structured = dict(_ctx)
                         with self._base_context_lock:
-                            self._base_context_cache = formatted
-                        base_context = formatted
+                            self._base_context_cache = structured
+                        base_context = structured
                 elif _bt.is_alive():
                     logger.debug(
                         "Honcho first-turn base context still running after %.1fs — "
@@ -770,12 +774,10 @@ class HonchoMemoryProvider(MemoryProvider):
                 if fresh_ctx:
                     formatted = self._format_first_turn_context(fresh_ctx)
                     if formatted:
+                        structured = dict(fresh_ctx)
                         with self._base_context_lock:
-                            self._base_context_cache = formatted
-                        base_context = formatted
-
-            if base_context:
-                parts.append(base_context)
+                            self._base_context_cache = structured
+                        base_context = structured
 
         # ----- Layer 2: Dialectic supplement -----
         # Turn 1 may briefly wait for dialectic; unfinished work remains async.
@@ -833,17 +835,7 @@ class HonchoMemoryProvider(MemoryProvider):
         # Consume only results that are already ready; later turns never wait.
         dialectic_result = self._consume_pending_dialectic()
 
-        if dialectic_result and dialectic_result.strip():
-            parts.append(dialectic_result)
-
-        if not parts:
-            return ""
-
-        result = "\n\n".join(parts)
-
-        result = self._truncate_to_budget(result)
-
-        return result
+        return self._fit_context_to_budget(base_context, dialectic_result)
 
     def _consume_pending_dialectic(self) -> str:
         """Pop any pending dialectic result, applying the stale-discard guard.
@@ -867,19 +859,192 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         return dialectic_result if (dialectic_result and dialectic_result.strip()) else ""
 
+    _CONTEXT_SECTIONS = (
+        ("summary", "summary", "Session Summary"),
+        ("representation", "user_representation", "User Representation"),
+        ("card", "user_card", "User Peer Card"),
+        ("ai_representation", "ai_representation", "AI Self-Representation"),
+        ("ai_card", "ai_card", "AI Identity Card"),
+    )
+
+    @staticmethod
+    def _truncate_fragment(text: str, max_chars: int) -> str:
+        """Fit one context section without exceeding ``max_chars``."""
+        text = text.strip()
+        if max_chars <= 0 or not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+
+        suffix = " …"
+        if max_chars <= len(suffix):
+            return ""
+        cut_at = max_chars - len(suffix)
+        truncated = text[:cut_at]
+        last_space = truncated.rfind(" ")
+        if last_space > cut_at * 0.8:
+            truncated = truncated[:last_space]
+        return truncated.rstrip() + suffix
+
+    def _fit_context_to_budget(
+        self,
+        base_context: Optional[dict[str, str] | str],
+        dialectic_result: Optional[str],
+    ) -> str:
+        """Fit structured Honcho context while preserving durable peer cards.
+
+        ``contextTokens`` applies to the combined base and dialectic layers. The
+        previous prefix cut accidentally made section order equal priority: a
+        long session summary could consume the budget before either card was
+        reached. Keep the original dictionary structured through budgeting so
+        card content that resembles a markdown heading cannot alter boundaries.
+        Reserve fair space for both cards, then allocate softer sections by
+        semantic priority and render survivors in their existing display order.
+        """
+        dialectic_result = (dialectic_result or "").strip()
+        structured = base_context if isinstance(base_context, dict) else None
+        base_text = (
+            self._format_first_turn_context(structured)
+            if structured is not None
+            else (base_context.strip() if isinstance(base_context, str) else "")
+        )
+        combined = "\n\n".join(
+            part for part in (base_text, dialectic_result) if part
+        )
+        if not combined:
+            return ""
+        if not self._config or not self._config.context_tokens:
+            return combined
+
+        budget_chars = self._config.context_tokens * 4
+        if len(combined) <= budget_chars:
+            return combined
+
+        if structured is None:
+            # Unknown/legacy formatting is opaque. Never parse user-controlled
+            # text in an attempt to recover section boundaries.
+            return self._truncate_to_budget(combined)
+
+        sections: list[dict[str, Any]] = []
+        for order, (source_key, key, title) in enumerate(self._CONTEXT_SECTIONS):
+            content = (structured.get(source_key) or "").strip()
+            if content:
+                sections.append({
+                    "key": key,
+                    "title": title,
+                    "content": content,
+                    "order": order,
+                })
+
+        if dialectic_result:
+            sections.append({
+                "key": "dialectic",
+                "title": "",
+                "content": dialectic_result,
+                "order": len(self._CONTEXT_SECTIONS),
+            })
+
+        selected: dict[int, str] = {}
+        remaining = budget_chars
+
+        # Reserve capacity for both durable cards before any softer layer. If
+        # they fit, both remain complete. If they do not, water-fill the content
+        # capacity so an oversized user card cannot erase the AI card entirely.
+        card_indices = [
+            index
+            for index, section in enumerate(sections)
+            if section["key"] in {"user_card", "ai_card"}
+        ]
+        if card_indices:
+            fixed_cost = sum(
+                len(f"## {sections[index]['title']}\n") + 2
+                for index in card_indices
+            )
+            content_capacity = remaining - fixed_cost
+            if content_capacity < len(card_indices) * 3:
+                # At pathological tiny budgets, keep the first durable card
+                # (normally the user card) rather than empty headings.
+                card_indices = card_indices[:1]
+                fixed_cost = sum(
+                    len(f"## {sections[index]['title']}\n") + 2
+                    for index in card_indices
+                )
+                content_capacity = remaining - fixed_cost
+
+            allocations: dict[int, int] = {}
+            pending = list(card_indices)
+            while pending and content_capacity > 0:
+                share = content_capacity // len(pending)
+                if share <= 0:
+                    break
+                completed = [
+                    index
+                    for index in pending
+                    if len(sections[index]["content"]) <= share
+                ]
+                if completed:
+                    for index in completed:
+                        size = len(sections[index]["content"])
+                        allocations[index] = size
+                        content_capacity -= size
+                        pending.remove(index)
+                    continue
+                for index in pending[:-1]:
+                    allocations[index] = share
+                    content_capacity -= share
+                allocations[pending[-1]] = content_capacity
+                content_capacity = 0
+                pending.clear()
+
+            for section_index in card_indices:
+                fitted = self._truncate_fragment(
+                    sections[section_index]["content"],
+                    allocations.get(section_index, 0),
+                )
+                if not fitted:
+                    continue
+                selected[section_index] = fitted
+                header = f"## {sections[section_index]['title']}\n"
+                remaining -= len(header) + len(fitted) + 2
+
+        # User representation is the next durable continuity layer. Dialectic is
+        # query-specific, summary is largely duplicated by live history, and AI
+        # representation is lowest priority because persona is supplied elsewhere.
+        priority = (
+            "user_representation",
+            "dialectic",
+            "summary",
+            "ai_representation",
+        )
+        for key in priority:
+            for section_index, section in enumerate(sections):
+                if section["key"] != key:
+                    continue
+                title = section["title"]
+                header = f"## {title}\n" if title else ""
+                # Charge one separator per section. This over-reserves two chars
+                # for the final section, keeping the rendered result strictly
+                # inside the cap without a second destructive cut.
+                available = remaining - len(header) - 2
+                fitted = self._truncate_fragment(section["content"], available)
+                if not fitted:
+                    continue
+                selected[section_index] = fitted
+                remaining -= len(header) + len(fitted) + 2
+
+        rendered = []
+        for section_index in sorted(selected, key=lambda i: sections[i]["order"]):
+            section = sections[section_index]
+            header = f"## {section['title']}\n" if section["title"] else ""
+            rendered.append(header + selected[section_index])
+        return "\n\n".join(rendered)
+
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""
         if not self._config or not self._config.context_tokens:
             return text
         budget_chars = self._config.context_tokens * 4  # conservative char estimate
-        if len(text) <= budget_chars:
-            return text
-        # Truncate at word boundary
-        truncated = text[:budget_chars]
-        last_space = truncated.rfind(" ")
-        if last_space > budget_chars * 0.8:
-            truncated = truncated[:last_space]
-        return truncated + " …"
+        return self._truncate_fragment(text, budget_chars)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire background prefetch threads for the upcoming turn.
