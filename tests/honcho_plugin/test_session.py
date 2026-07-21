@@ -1099,6 +1099,56 @@ class TestStructureAwareContextBudget:
 
         assert allocations == {0: 10, 1: 45, 2: 45}
 
+    def test_weighted_allocation_proves_three_two_two_ratio(self):
+        allocations = HonchoMemoryProvider._weighted_fair_allocations(
+            demands={0: 100, 1: 100, 2: 100},
+            weights={0: 3, 1: 2, 2: 2},
+            capacity=70,
+        )
+
+        assert allocations == {0: 30, 1: 20, 2: 20}
+
+    def test_tiny_residual_budget_charges_headers_and_separators(self):
+        provider = self._provider(20)  # 80 conservative characters
+        base = {
+            "summary": "S" * 100,
+            "representation": "R" * 100,
+            "card": "U",
+            "ai_card": "A",
+        }
+
+        result = provider._fit_context_to_budget(base, "D" * 100)
+
+        assert len(result) <= 80
+        assert "## User Peer Card\nU" in result
+        assert "## AI Identity Card\nA" in result
+        assert "## User Representation" in result
+        assert "## Session Summary" not in result
+        assert result.split("\n\n")[-1].startswith("D")
+        for block in result.split("\n\n"):
+            if block.startswith("## "):
+                heading, content = block.split("\n", 1)
+                assert heading
+                assert content
+
+    def test_ai_representation_receives_only_post_soft_leftovers(self):
+        provider = self._provider(40)  # 160 conservative characters
+        base = {
+            "summary": "FULL-SUMMARY",
+            "representation": "FULL-USER-REPRESENTATION",
+            "ai_representation": "AI-LEFTOVER " + "x" * 300,
+        }
+        dialectic = "FULL-DIALECTIC"
+
+        result = provider._fit_context_to_budget(base, dialectic)
+
+        assert len(result) <= 160
+        assert "FULL-SUMMARY" in result
+        assert "FULL-USER-REPRESENTATION" in result
+        assert "FULL-DIALECTIC" in result
+        assert "AI-LEFTOVER" in result
+        assert "x" * 300 not in result
+
     def test_oversized_summary_is_bounded_without_evicting_user_card(self):
         provider = self._provider(45)  # 180 conservative characters
         base = {
