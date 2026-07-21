@@ -1090,7 +1090,16 @@ class TestStructureAwareContextBudget:
         provider._config = HonchoClientConfig(context_tokens=context_tokens)
         return provider
 
-    def test_oversized_summary_does_not_evict_user_card(self):
+    def test_weighted_allocation_redistributes_unused_share(self):
+        allocations = HonchoMemoryProvider._weighted_fair_allocations(
+            demands={0: 10, 1: 100, 2: 100},
+            weights={0: 3, 1: 2, 2: 2},
+            capacity=100,
+        )
+
+        assert allocations == {0: 10, 1: 45, 2: 45}
+
+    def test_oversized_summary_is_bounded_without_evicting_user_card(self):
         provider = self._provider(45)  # 180 conservative characters
         base = {
             "summary": "recent vivid thread " * 80,
@@ -1104,7 +1113,8 @@ class TestStructureAwareContextBudget:
         assert "## User Peer Card" in result
         assert "Name: Eri" in result
         assert "Preference: verified facts first" in result
-        assert "recent vivid thread" not in result
+        assert "## Session Summary" in result
+        assert "recent vivid thread" in result
 
     def test_dialectic_supplement_cannot_evict_user_card(self):
         provider = self._provider(35)  # 140 conservative characters
@@ -1182,20 +1192,43 @@ class TestStructureAwareContextBudget:
         assert result.count("## Session Summary") == 1
         assert "REAL-CARD-TAIL" in result
 
-    def test_user_representation_precedes_dialectic_in_allocation(self):
-        provider = self._provider(55)  # 220 conservative characters
+    def test_soft_context_uses_weighted_reservations_after_realistic_cards(self):
+        provider = self._provider(1500)  # 6000 conservative characters
         base = {
-            "card": "Name: Eri",
-            "representation": "USER-REPRESENTATION-TAIL " + "rep " * 20,
-            "summary": "summary " * 100,
+            "summary": "SUMMARY-BEGIN " + "summary " * 2000,
+            "representation": "USER-REPRESENTATION-BEGIN " + "rep " * 2000,
+            "card": "USER-CARD-BEGIN " + "u" * 1800 + " USER-CARD-TAIL",
+            "ai_representation": "AI-REPRESENTATION-BEGIN " + "ai-rep " * 2000,
+            "ai_card": "AI-CARD-BEGIN " + "a" * 1240 + " AI-CARD-TAIL",
         }
-        dialectic = "DIALECTIC " * 100
+        dialectic = "DIALECTIC-BEGIN " + "dialectic " * 2000
 
         result = provider._fit_context_to_budget(base, dialectic)
 
-        assert len(result) <= 55 * 4
-        assert "USER-REPRESENTATION-TAIL" in result
-        assert "## Session Summary" not in result
+        assert len(result) <= 1500 * 4
+        assert "USER-CARD-TAIL" in result
+        assert "AI-CARD-TAIL" in result
+        assert "USER-REPRESENTATION-BEGIN" in result
+        assert "DIALECTIC-BEGIN" in result
+        assert "SUMMARY-BEGIN" in result
+        assert "AI-REPRESENTATION-BEGIN" not in result
+
+    def test_missing_dialectic_redistributes_space_between_representation_and_summary(self):
+        provider = self._provider(1500)
+        base = {
+            "summary": "SUMMARY-BEGIN " + "summary " * 2000,
+            "representation": "USER-REPRESENTATION-BEGIN " + "rep " * 2000,
+            "card": "USER-CARD-BEGIN " + "u" * 1800 + " USER-CARD-TAIL",
+            "ai_card": "AI-CARD-BEGIN " + "a" * 1240 + " AI-CARD-TAIL",
+        }
+
+        result = provider._fit_context_to_budget(base, "")
+
+        assert len(result) <= 1500 * 4
+        assert "USER-CARD-TAIL" in result
+        assert "AI-CARD-TAIL" in result
+        assert "USER-REPRESENTATION-BEGIN" in result
+        assert "SUMMARY-BEGIN" in result
 
     def test_prefetch_routes_combined_layers_through_structure_aware_budget(self):
         provider = self._provider(45)
@@ -1220,7 +1253,9 @@ class TestStructureAwareContextBudget:
         assert len(result) <= 45 * 4
         assert "## User Peer Card" in result
         assert "Preference: durable card wins" in result
-        assert "## Session Summary" not in result
+        assert "## Session Summary" in result
+        assert "## User Representation" in result
+        assert "dialectic" in result
 
 
 # ---------------------------------------------------------------------------

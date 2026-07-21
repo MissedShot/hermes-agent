@@ -886,6 +886,43 @@ class HonchoMemoryProvider(MemoryProvider):
             truncated = truncated[:last_space]
         return truncated.rstrip() + suffix
 
+    @staticmethod
+    def _weighted_fair_allocations(
+        demands: dict[int, int],
+        weights: dict[int, int],
+        capacity: int,
+    ) -> dict[int, int]:
+        """Water-fill ``capacity`` across demands according to positive weights.
+
+        Sections shorter than their weighted share are completed first and their
+        unused capacity is redistributed among the remaining sections.
+        """
+        allocations: dict[int, int] = {}
+        pending = list(demands)
+        remaining = max(0, capacity)
+
+        while pending and remaining > 0:
+            total_weight = sum(weights[index] for index in pending)
+            shares: dict[int, int] = {}
+            distributed = 0
+            for index in pending[:-1]:
+                share = remaining * weights[index] // total_weight
+                shares[index] = share
+                distributed += share
+            shares[pending[-1]] = remaining - distributed
+
+            completed = [index for index in pending if demands[index] <= shares[index]]
+            if not completed:
+                allocations.update(shares)
+                break
+
+            for index in completed:
+                allocations[index] = demands[index]
+                remaining -= demands[index]
+                pending.remove(index)
+
+        return allocations
+
     def _fit_context_to_budget(
         self,
         base_context: Optional[dict[str, str] | str],
@@ -898,8 +935,8 @@ class HonchoMemoryProvider(MemoryProvider):
         long session summary could consume the budget before either card was
         reached. Keep the original dictionary structured through budgeting so
         card content that resembles a markdown heading cannot alter boundaries.
-        Reserve fair space for both cards, then allocate softer sections by
-        semantic priority and render survivors in their existing display order.
+        Reserve fair space for both cards, then weighted-fair-share softer
+        sections and render survivors in their existing display order.
         """
         dialectic_result = (dialectic_result or "").strip()
         structured = base_context if isinstance(base_context, dict) else None
@@ -1007,30 +1044,86 @@ class HonchoMemoryProvider(MemoryProvider):
                 header = f"## {sections[section_index]['title']}\n"
                 remaining -= len(header) + len(fitted) + 2
 
-        # User representation is the next durable continuity layer. Dialectic is
-        # query-specific, summary is largely duplicated by live history, and AI
-        # representation is lowest priority because persona is supplied elsewhere.
-        priority = (
-            "user_representation",
-            "dialectic",
-            "summary",
-            "ai_representation",
-        )
-        for key in priority:
-            for section_index, section in enumerate(sections):
-                if section["key"] != key:
-                    continue
-                title = section["title"]
-                header = f"## {title}\n" if title else ""
-                # Charge one separator per section. This over-reserves two chars
-                # for the final section, keeping the rendered result strictly
-                # inside the cap without a second destructive cut.
-                available = remaining - len(header) - 2
-                fitted = self._truncate_fragment(section["content"], available)
+        # Share the post-card budget across the three useful soft layers instead
+        # of letting the first oversized one starve the rest. The 3:2:2 weights
+        # favor durable user representation while reserving meaningful space for
+        # query-specific dialectic and the session summary. Missing/short layers
+        # automatically donate their unused share to the others.
+        soft_weights = {
+            "user_representation": 3,
+            "dialectic": 2,
+            "summary": 2,
+        }
+        soft_indices = [
+            section_index
+            for key in soft_weights
+            for section_index, section in enumerate(sections)
+            if section["key"] == key
+        ]
+
+        # Tiny residual budgets should produce useful content, not empty headings.
+        # Drop the lowest-priority soft layer until every survivor can receive at
+        # least a three-character fragment (the minimum useful truncated shape).
+        while soft_indices:
+            fixed_cost = sum(
+                len(f"## {sections[index]['title']}\n") + 2
+                if sections[index]["title"]
+                else 2
+                for index in soft_indices
+            )
+            content_capacity = remaining - fixed_cost
+            total_weight = sum(
+                soft_weights[sections[index]["key"]] for index in soft_indices
+            )
+            if content_capacity > 0 and all(
+                content_capacity * soft_weights[sections[index]["key"]] // total_weight
+                >= 3
+                for index in soft_indices
+            ):
+                break
+            soft_indices.pop()
+
+        if soft_indices:
+            fixed_cost = sum(
+                len(f"## {sections[index]['title']}\n") + 2
+                if sections[index]["title"]
+                else 2
+                for index in soft_indices
+            )
+            content_capacity = remaining - fixed_cost
+            demands = {index: len(sections[index]["content"]) for index in soft_indices}
+            weights = {
+                index: soft_weights[sections[index]["key"]] for index in soft_indices
+            }
+            allocations = self._weighted_fair_allocations(
+                demands,
+                weights,
+                content_capacity,
+            )
+            for section_index in soft_indices:
+                section = sections[section_index]
+                fitted = self._truncate_fragment(
+                    section["content"],
+                    allocations.get(section_index, 0),
+                )
                 if not fitted:
                     continue
                 selected[section_index] = fitted
+                header = f"## {section['title']}\n" if section["title"] else ""
                 remaining -= len(header) + len(fitted) + 2
+
+        # AI representation is lowest priority because persona is supplied by
+        # the system layer and durable AI card. It receives only true leftovers.
+        for section_index, section in enumerate(sections):
+            if section["key"] != "ai_representation":
+                continue
+            header = f"## {section['title']}\n"
+            available = remaining - len(header) - 2
+            fitted = self._truncate_fragment(section["content"], available)
+            if fitted:
+                selected[section_index] = fitted
+                remaining -= len(header) + len(fitted) + 2
+            break
 
         rendered = []
         for section_index in sorted(selected, key=lambda i: sections[i]["order"]):
